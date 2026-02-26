@@ -18,9 +18,21 @@ if uploaded_file:
     vsource = pd.read_excel(uploaded_file, sheet_name="vSource")
     vsource.columns = vsource.columns.str.strip()
 
-    vcenter_name = vsource["VI SDK Server"].iloc[0]
-    from streamlit_tree_select import tree_select
+    vcenter_name = ""
 
+    try:
+        vsource = pd.read_excel(uploaded_file, sheet_name="vSource")
+        vsource.columns = vsource.columns.str.strip()
+
+        if "VI SDK Server" in vsource.columns:
+            value = vsource["VI SDK Server"].iloc[0]
+            if pd.notna(value):
+                vcenter_name = str(value).strip()
+
+    except Exception as e:
+        # If vSource sheet doesn't exist, ignore
+        pass
+    from streamlit_tree_select import tree_select
     st.divider()
     st.subheader("🖥 vSphere Inventory")
 
@@ -153,7 +165,7 @@ if uploaded_file:
     col2.metric("Total Hosts", total_hosts)
     col3.metric("Total Clusters", total_clusters)
     col4.metric("Total Physical CPU Cores", total_cpu)
-    col5.metric("Total Physical RAM (TB)", total_ram_tb)
+    col5.metric("Total Physical RAM (GB)", total_ram_tb)
 
     st.divider()
 
@@ -167,7 +179,7 @@ if uploaded_file:
     cluster_summary = vhost.groupby("Cluster").agg(
         Hosts=("Host", "count"),
         Total_CPU_Cores=("# Cores", "sum"),
-        Total_RAM_GB=("# Memory", "sum")
+        Total_RAM_MB=("# Memory", "sum")
     ).reset_index()
 
     st.dataframe(cluster_summary, use_container_width=True)
@@ -204,13 +216,13 @@ if uploaded_file:
     # VM aggregation
     cluster_vm = vinfo.groupby("Cluster").agg(
         Total_vCPUs=(vm_cpu_column, "sum"),
-        Total_vRAM_GB=(vm_ram_column, "sum")
+        Total_vRAM_MB=(vm_ram_column, "sum")
     ).reset_index()
 
     # Host aggregation
     cluster_host = vhost.groupby("Cluster").agg(
         Physical_Cores=("# Cores", "sum"),
-        Physical_RAM_GB=("# Memory", "sum")
+        Physical_RAM_MB=("# Memory", "sum")
     ).reset_index()
 
     cluster_analysis = pd.merge(cluster_vm, cluster_host, on="Cluster")
@@ -222,8 +234,8 @@ if uploaded_file:
     ).round(2)
 
     cluster_analysis["Memory_Overcommit_Ratio"] = (
-            cluster_analysis["Total_vRAM_GB"] /
-            cluster_analysis["Physical_RAM_GB"]
+            cluster_analysis["Total_vRAM_MB"] /
+            cluster_analysis["Physical_RAM_MB"]
     ).round(2)
 
 
