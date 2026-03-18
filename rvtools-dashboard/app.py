@@ -92,6 +92,7 @@ def resolve_esxi_support(
 def extract_vcenter_name_from_vsource(xls: pd.ExcelFile) -> str:
     """
     Get vCenter name from vSource sheet, column 'VI SDK Server', first row.
+    Returns empty string if not found.
     """
     try:
         vsource = pd.read_excel(xls, sheet_name="vSource")
@@ -102,7 +103,7 @@ def extract_vcenter_name_from_vsource(xls: pd.ExcelFile) -> str:
                 return str(value).strip()
     except Exception:
         pass
-    return "Unknown vCenter"
+    return ""  # return empty if not found
 
 def run_cpu_esxi_summary_for_vhost(
     vhost: pd.DataFrame,
@@ -291,7 +292,10 @@ if st.button("Run Analysis"):
 
     st.success("Files loaded. Running analysis...")
 
-    for uploaded_file in rvtools_files:
+    # counter to ensure unique names when vCenter not found
+    unknown_counter = 0
+
+    for idx, uploaded_file in enumerate(rvtools_files):
         st.divider()
         st.subheader(f"📁 RVTools File: {uploaded_file.name}")
 
@@ -303,7 +307,13 @@ if st.button("Run Analysis"):
             continue
 
         # Get vCenter name from vSource
-        vcenter_name = extract_vcenter_name_from_vsource(xls)
+        raw_vcenter_name = extract_vcenter_name_from_vsource(xls)
+
+        if raw_vcenter_name:
+            vcenter_name = raw_vcenter_name
+        else:
+            unknown_counter += 1
+            vcenter_name = f"Unknown_vCenter_{unknown_counter}"
 
         st.markdown(f"**vCenter:** `{vcenter_name}`")
 
@@ -347,11 +357,19 @@ if st.button("Run Analysis"):
 
         # Create Excel for download
         excel_bytes = create_per_vcenter_excel(cpu_df, cluster_df)
+
+        # Generate a safe base for the filename
+        safe_vcenter_name = (
+            vcenter_name.replace(" ", "_").replace(".", "_").replace("/", "_")
+        )
+
+        # Use a unique key per button to avoid StreamlitDuplicateElementId
         st.download_button(
             label=f"⬇️ Download Excel report for {vcenter_name}",
             data=excel_bytes,
-            file_name=f"{vcenter_name.replace('.', '_')}_ESXi9_Report.xlsx",
+            file_name=f"{safe_vcenter_name}_ESXi9_Report.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"download_{safe_vcenter_name}_{idx}",
         )
 else:
     st.info("Upload files and click **Run Analysis** to start.")
