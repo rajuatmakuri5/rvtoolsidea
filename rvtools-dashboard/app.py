@@ -1,264 +1,357 @@
-import streamlit as st
+import io
+import os
+import re
+from typing import Dict, List, Tuple, Optional
+
 import pandas as pd
-import plotly.express as px
+import streamlit as st
 
-st.set_page_config(layout="wide")
-st.title("🚀 RVTools Interactive Analyzer")
+# ---------------------------------------------------------
+# HCL configuration
+# ---------------------------------------------------------
 
-uploaded_file = st.file_uploader("Upload RVTools Excel Export", type=["xlsx"])
+CPU_SERIES_COL = "CPU Series"
+SUPPORTED_RELEASES_COL = "Supported Releases"  # adjust if different in your HCL
 
-if uploaded_file:
+# ---------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------
 
+def normalize_cpu_model(cpu_model: str) -> Tuple[str, Optional[str]]:
+    """
+    Normalize an RVTools CPU Model string to a Broadcom-style CPU Series.
+
+    Example:
+      "Intel(R) Xeon(R) Gold 5317 CPU @ 3.00GHz" -> "Intel Xeon Gold 5300"
+      "Intel(R) Xeon(R) Gold 6426Y" -> "Intel Xeon Gold 6400"
+    """
+    original = str(cpu_model)
+    s = original
+
+    # Remove (R), "CPU" word, extra spaces
+    s = s.replace("(R)", "").replace("CPU", "")
+    s = " ".join(s.split())
+
+    # Remove frequency suffixes like "@ 3.00GHz"
+    s = re.sub(r"@\s*\d+(\.\d+)?\s*GHz", "", s, flags=re.IGNORECASE)
+    s = " ".join(s.split())
+
+    # Regex to find something like "Intel Xeon Gold 5317"
+    m = re.search(
+        r"(Intel)\s+Xeon\s+(Gold|Silver|Bronze|Platinum)\s+(\d+)",
+        s,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        # Fallback: return cleaned string as-is
+        return (
+            s.strip(),
+            f"Could not confidently map SKU for '{original}', using '{s.strip()}' as CPU Series",
+        )
+
+    vendor = m.group(1).strip()
+    family = m.group(2).strip()
+    sku_str = m.group(3).strip()
+
+    # Basic rule: take the first two digits as the "hundreds" series
+    if len(sku_str) >= 2:
+        hundreds = int(sku_str[:2]) * 100
+    else:
+        hundreds = int(sku_str) * 100
+
+    series = f"{vendor} Xeon {family} {hundreds}"
+    return series, None
+
+def resolve_esxi_support(
+    cpu_series: str, hcl_df: pd.DataFrame, esxi_versions: List[str]
+) -> Tuple[Dict[str, str], bool]:
+    """
+    For a given CPU Series, check ESXi version support in the HCL.
+
+    Returns:
+      (support_map, not_found)
+      - support_map: { "ESXi 9.0": "Yes"/"No"/"Unknown", ... }
+      - not_found: True if CPU Series was not found at all in the HCL.
+    """
+    mask = hcl_df[CPU_SERIES_COL].astype(str).str.contains(
+        cpu_series, case=False, na=False
+    )
+    subset = hcl_df[mask]
+
+    if subset.empty:
+        return {v: "Unknown" for v in esxi_versions}, True
+
+    results: Dict[str, str] = {}
+    for v in esxi_versions:
+        found = subset[SUPPORTED_RELEASES_COL].astype(str).str.contains(
+            v, case=False, na=False
+        ).any()
+        results[v] = "Yes" if found else "No"
+    return results, False
+
+def extract_vcenter_name_from_vsource(xls: pd.ExcelFile) -> str:
+    """
+    Get vCenter name from vSource sheet, column 'VI SDK Server', first row.
+    """
     try:
-        vinfo = pd.read_excel(uploaded_file, sheet_name="vInfo")
-        vhost = pd.read_excel(uploaded_file, sheet_name="vHost")
-    except Exception as e:
-        st.error(f"Error reading Excel file: {e}")
-        st.stop()
-    vsource = pd.read_excel(uploaded_file, sheet_name="vSource")
-    vsource.columns = vsource.columns.str.strip()
-
-    vcenter_name = ""
-
-    try:
-        vsource = pd.read_excel(uploaded_file, sheet_name="vSource")
+        vsource = pd.read_excel(xls, sheet_name="vSource")
         vsource.columns = vsource.columns.str.strip()
-
-        if "VI SDK Server" in vsource.columns:
+        if "VI SDK Server" in vsource.columns and not vsource.empty:
             value = vsource["VI SDK Server"].iloc[0]
             if pd.notna(value):
-                vcenter_name = str(value).strip()
-
-    except Exception as e:
-        # If vSource sheet doesn't exist, ignore
+                return str(value).strip()
+    except Exception:
         pass
-    from streamlit_tree_select import tree_select
-    st.divider()
-    st.subheader("🖥 vSphere Inventory")
+    return "Unknown vCenter"
 
-    col1, col2 = st.columns([1, 2])
+def run_cpu_esxi_summary_for_vhost(
+    vhost: pd.DataFrame,
+    hcl_df: pd.DataFrame,
+    esxi_versions: Optional[List[str]] = None,
+) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Run CPU / ESXi summary using a vHost DataFrame and the HCL DataFrame.
+    """
+    if esxi_versions is None:
+        esxi_versions = ["ESXi 9.0", "ESXi 9.1"]
 
+    expected_cols = {"CPU Model", "Vendor", "Model"}
+    missing = expected_cols - set(vhost.columns)
+    if missing:
+        raise ValueError(f"vHost sheet is missing columns: {missing}")
 
-    # -----------------------------
-    # BUILD UNIQUE TREE
-    # -----------------------------
-    def build_tree(vinfo_df):
-        tree = []
+    subset = vhost[["CPU Model", "Vendor", "Model"]].copy()
+    subset = subset.dropna(how="all")
 
-        for dc in sorted(vinfo_df["Datacenter"].dropna().unique()):
-            dc_value = f"dc::{dc} ({vcenter_name})"
-            dc_node = {"label": f"🏢 {dc} ({vcenter_name}) ", "value": dc_value, "children": []}
+    grouped = (
+        subset.groupby(["CPU Model", "Vendor", "Model"], dropna=False)
+        .size()
+        .reset_index(name="Host count")
+    )
+    tuples = grouped.to_dict(orient="records")
 
-            dc_data = vinfo_df[vinfo_df["Datacenter"] == dc]
+    summary_rows: List[Dict] = []
+    assumptions: List[str] = []
 
-            for cluster in sorted(dc_data["Cluster"].dropna().unique()):
-                cluster_value = f"{dc_value}|cluster::{cluster}"
-                cluster_node = {"label": f"🧱 {cluster}", "value": cluster_value, "children": []}
+    for row in tuples:
+        cpu_model = row["CPU Model"]
+        vendor = row["Vendor"]
+        model = row["Model"]
+        host_count = row["Host count"]
 
-                cluster_data = dc_data[dc_data["Cluster"] == cluster]
+        cpu_series, note = normalize_cpu_model(cpu_model)
+        if note:
+            assumptions.append(note)
 
-                for host in sorted(cluster_data["Host"].dropna().unique()):
-                    host_value = f"{cluster_value}|host::{host}"
-                    host_node = {"label": f"🖥 {host}", "value": host_value, "children": []}
+        support_map, not_found = resolve_esxi_support(cpu_series, hcl_df, esxi_versions)
+        if not_found:
+            assumptions.append(
+                f"No HCL entries found for CPU Series '{cpu_series}' (from '{cpu_model}')"
+            )
 
-                    host_data = cluster_data[cluster_data["Host"] == host]
+        summary_row = {
+            "CPU Model": cpu_model,
+            "Vendor": vendor,
+            "Model": model,
+            "CPU Series": cpu_series,
+            "Host count": host_count,
+        }
+        for v in esxi_versions:
+            summary_row[v] = support_map.get(v, "Unknown")
 
-                    for vm in sorted(host_data["VM"].dropna().unique()):
-                        vm_value = f"{host_value}|vm::{vm}"
-                        vm_node = {"label": f"🟢 {vm}", "value": vm_value}
-                        host_node["children"].append(vm_node)
+        summary_rows.append(summary_row)
 
-                    cluster_node["children"].append(host_node)
+    cpu_df = pd.DataFrame(summary_rows)
 
-                dc_node["children"].append(cluster_node)
+    # Deduplicate assumptions
+    seen = set()
+    uniq_assumptions = []
+    for a in assumptions:
+        if a not in seen:
+            seen.add(a)
+            uniq_assumptions.append(a)
 
-            tree.append(dc_node)
+    return cpu_df, uniq_assumptions
 
-        return tree
-
-
-    tree_data = build_tree(vinfo)
-
-    with col1:
-        selected = tree_select(tree_data)
-
-    # -----------------------------
-    # DETAILS PANEL
-    # -----------------------------
-    with col2:
-
-        if selected["checked"]:
-            node = selected["checked"][0]
-
-            if "dc::" in node and "cluster::" not in node:
-                #st.header(f"🏢 Datacenter: {node}")
-                dc_name = node.split("dc::")[1].split("(")[0].strip()
-                #st.header(f"🏢 Datacenter: {dc_name}")
-                st.header(f"🏢 Datacenter: {dc_name}")
-
-                dc_data = vinfo[vinfo["Datacenter"] == dc_name]
-                st.metric("Total VMs", len(dc_data))
-                st.metric("Clusters", dc_data["Cluster"].nunique())
-
-            elif "cluster::" in node and "host::" not in node:
-                cluster_name = node.split("cluster::")[1]
-                st.header(f"🧱 Cluster: {cluster_name}")
-
-                cluster_hosts = vhost[vhost["Cluster"] == cluster_name]
-                cluster_vms = vinfo[vinfo["Cluster"] == cluster_name]
-
-                total_cpu = cluster_hosts["# Cores"].sum()
-                total_ram = cluster_hosts["# Memory"].sum()
-                total_vcpu = cluster_vms["CPUs"].sum()
-                total_vram = cluster_vms["Memory"].sum()
-
-                cpu_ratio = round(total_vcpu / total_cpu, 2)
-                mem_ratio = round(total_vram / total_ram, 2)
-
-                st.metric("Hosts", len(cluster_hosts))
-                st.metric("Total VMs", len(cluster_vms))
-                st.metric("CPU Overcommit", cpu_ratio)
-                st.metric("Memory Overcommit", mem_ratio)
-
-            elif "host::" in node and "vm::" not in node:
-                host_name = node.split("host::")[1]
-                st.header(f"🖥 Host: {host_name}")
-
-                host_data = vhost[vhost["Host"] == host_name].iloc[0]
-
-                st.metric("CPU Model", host_data["CPU Model"])
-                st.metric("Total Cores", host_data["# Cores"])
-                st.metric("Total Memory (MB)", host_data["# Memory"])
-                st.metric("Vendor", host_data["Vendor"])
-                st.metric("ESXi Version", host_data["ESX Version"])
-
-            elif "vm::" in node:
-                vm_name = node.split("vm::")[1]
-                st.header(f"🟢 VM: {vm_name}")
-
-                vm_data = vinfo[vinfo["VM"] == vm_name].iloc[0]
-
-                st.metric("vCPU", vm_data["CPUs"])
-                st.metric("vRAM (MB)", vm_data["Memory"])
-                st.metric("Power State", vm_data["Powerstate"])
-                st.metric("Guest OS", vm_data["OS according to the configuration file"])
-
-        else:
-            st.info("Select an object from the inventory tree.")
-
-    # Clean column names
-    vhost.columns = vhost.columns.str.strip()
-    vinfo.columns = vinfo.columns.str.strip()
-
-    # -----------------------------
-    # GLOBAL STATS
-    # -----------------------------
-    total_vms = len(vinfo)
-    total_hosts = vhost["Host"].nunique()
-    total_clusters = vhost["Cluster"].nunique()
-
-    total_cpu = vhost["# Cores"].sum()
-    total_ram_tb = round(vhost["# Memory"].sum() / 1024, 2)  # Memory is already in GB
-
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Total VMs", total_vms)
-    col2.metric("Total Hosts", total_hosts)
-    col3.metric("Total Clusters", total_clusters)
-    col4.metric("Total Physical CPU Cores", total_cpu)
-    col5.metric("Total Physical RAM (GB)", total_ram_tb)
-
-    st.divider()
-
-
-
-    # -----------------------------
-    # CLUSTER SUMMARY
-    # -----------------------------
-    st.subheader("📊 Cluster Summary")
-
-    cluster_summary = vhost.groupby("Cluster").agg(
-        Hosts=("Host", "count"),
-        Total_CPU_Cores=("# Cores", "sum"),
-        Total_RAM_MB=("# Memory", "sum")
-    ).reset_index()
-
-    st.dataframe(cluster_summary, use_container_width=True)
-
-    st.divider()
-
-    # -----------------------------
-    # CLUSTER OVERCOMMIT ANALYSIS
-    # -----------------------------
-    st.subheader("⚠️ Cluster Overcommit Analysis")
-
-    # Detect VM CPU and Memory columns safely
-    vinfo.columns = vinfo.columns.str.strip()
-
-    # Try common VM CPU column names
-    vm_cpu_column = None
-    for col in vinfo.columns:
-        if "cpu" in col.lower():
-            vm_cpu_column = col
+def build_cluster_host_mapping(vhost: pd.DataFrame) -> pd.DataFrame:
+    """
+    From vHost DataFrame, build DataFrame:
+      Cluster | Host
+    """
+    host_col_candidates = ["Host", "Hostname", "ESX host", "Name"]
+    host_col = None
+    for c in host_col_candidates:
+        if c in vhost.columns:
+            host_col = c
             break
+    if host_col is None:
+        raise ValueError(
+            f"Could not find a host column in vHost sheet. "
+            f"Looked for: {host_col_candidates}"
+        )
+    if "Cluster" not in vhost.columns:
+        raise ValueError("vHost sheet does not contain a 'Cluster' column.")
 
-    # Try common VM memory column names
-    vm_ram_column = None
-    for col in vinfo.columns:
-        if "memory" in col.lower():
-            vm_ram_column = col
-            break
+    df = vhost.rename(columns={host_col: "Host"})
+    tmp = df[["Cluster", "Host"]].copy()
+    tmp = tmp.dropna(subset=["Cluster", "Host"])
 
-    if vm_cpu_column is None or vm_ram_column is None:
-        st.error("Could not detect VM CPU or Memory columns in vInfo sheet.")
-        st.write("vInfo Columns:", vinfo.columns.tolist())
+    tmp["Cluster"] = tmp["Cluster"].astype(str).str.strip()
+    tmp["Host"] = tmp["Host"].astype(str).str.strip()
+
+    rows = []
+    grouped = tmp.groupby("Cluster")["Host"].unique()
+    for cluster, hosts in grouped.items():
+        for h in sorted(hosts):
+            rows.append({"Cluster": cluster, "Host": h})
+
+    out = pd.DataFrame(rows).sort_values(by=["Cluster", "Host"]).reset_index(drop=True)
+    return out
+
+def create_per_vcenter_excel(cpu_df: pd.DataFrame, cluster_df: pd.DataFrame) -> bytes:
+    """
+    Create an Excel file in memory with two sheets:
+      - CPU_ESXi_Summary
+      - Cluster_Host_Mapping
+    Return as bytes for Streamlit download.
+    """
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        cpu_df.to_excel(writer, sheet_name="CPU_ESXi_Summary", index=False)
+        cluster_df.to_excel(writer, sheet_name="Cluster_Host_Mapping", index=False)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+# ---------------------------------------------------------
+# Streamlit App
+# ---------------------------------------------------------
+
+st.set_page_config(page_title="RVTools ESXi 9.x Analyzer", layout="wide")
+st.title("🚀 RVTools ESXi 9.x Compatibility Analyzer")
+
+st.markdown(
+    """
+Upload up to **5 RVTools Excel exports** and **one Broadcom Systems/Servers HCL** file.  
+For each RVTools file, this app will:
+
+1. Detect the **vCenter name** from the `vSource` sheet.  
+2. Generate a **CPU → ESXi 9.x support summary** (from `vHost` + HCL).  
+3. Generate a **Cluster → ESXi Host mapping** (from `vHost`).  
+4. Show the results in this UI and provide an **Excel download** per vCenter.
+"""
+)
+
+col_left, col_right = st.columns(2)
+
+with col_left:
+    rvtools_files = st.file_uploader(
+        "Upload RVTools Excel exports (max 5)",
+        type=["xlsx"],
+        accept_multiple_files=True,
+    )
+    if rvtools_files and len(rvtools_files) > 5:
+        st.warning("You uploaded more than 5 files; only the first 5 will be used.")
+        rvtools_files = rvtools_files[:5]
+
+with col_right:
+    hcl_file = st.file_uploader(
+        "Upload Broadcom Systems/Servers HCL (CSV or Excel)",
+        type=["csv", "xlsx", "xls"],
+    )
+
+esxi_versions = ["ESXi 9.0", "ESXi 9.1"]
+
+if st.button("Run Analysis"):
+
+    if not rvtools_files:
+        st.error("Please upload at least one RVTools Excel file.")
+        st.stop()
+    if not hcl_file:
+        st.error("Please upload the Broadcom HCL file.")
         st.stop()
 
-    # VM aggregation
-    cluster_vm = vinfo.groupby("Cluster").agg(
-        Total_vCPUs=(vm_cpu_column, "sum"),
-        Total_vRAM_MB=(vm_ram_column, "sum")
-    ).reset_index()
-
-    # Host aggregation
-    cluster_host = vhost.groupby("Cluster").agg(
-        Physical_Cores=("# Cores", "sum"),
-        Physical_RAM_MB=("# Memory", "sum")
-    ).reset_index()
-
-    cluster_analysis = pd.merge(cluster_vm, cluster_host, on="Cluster")
-
-    # Calculate ratios
-    cluster_analysis["CPU_Overcommit_Ratio"] = (
-            cluster_analysis["Total_vCPUs"] /
-            cluster_analysis["Physical_Cores"]
-    ).round(2)
-
-    cluster_analysis["Memory_Overcommit_Ratio"] = (
-            cluster_analysis["Total_vRAM_MB"] /
-            cluster_analysis["Physical_RAM_MB"]
-    ).round(2)
-
-
-    # Risk Classification
-    def classify_cpu(ratio):
-        if ratio > 4:
-            return "🔴 High"
-        elif ratio > 2:
-            return "🟡 Moderate"
+    # Load HCL into DataFrame
+    try:
+        hcl_ext = os.path.splitext(hcl_file.name)[1].lower()
+        if hcl_ext in [".csv", ".txt"]:
+            hcl_df = pd.read_csv(hcl_file)
         else:
-            return "🟢 Healthy"
+            hcl_df = pd.read_excel(hcl_file)
+        hcl_df.columns = hcl_df.columns.str.strip()
+        missing = {CPU_SERIES_COL, SUPPORTED_RELEASES_COL} - set(hcl_df.columns)
+        if missing:
+            st.error(
+                f"HCL file missing required columns: {missing}. "
+                f"Expected at least: {CPU_SERIES_COL!r}, {SUPPORTED_RELEASES_COL!r}"
+            )
+            st.stop()
+    except Exception as e:
+        st.error(f"Error reading HCL file: {e}")
+        st.stop()
 
+    st.success("Files loaded. Running analysis...")
 
-    def classify_memory(ratio):
-        if ratio > 1.5:
-            return "🔴 High"
-        elif ratio > 1:
-            return "🟡 Moderate"
-        else:
-            return "🟢 Healthy"
+    for uploaded_file in rvtools_files:
+        st.divider()
+        st.subheader(f"📁 RVTools File: {uploaded_file.name}")
 
+        # Load Excel once, reuse across sheets
+        try:
+            xls = pd.ExcelFile(uploaded_file)
+        except Exception as e:
+            st.error(f"Error reading Excel file {uploaded_file.name}: {e}")
+            continue
 
-    cluster_analysis["CPU_Risk"] = cluster_analysis["CPU_Overcommit_Ratio"].apply(classify_cpu)
-    cluster_analysis["Memory_Risk"] = cluster_analysis["Memory_Overcommit_Ratio"].apply(classify_memory)
+        # Get vCenter name from vSource
+        vcenter_name = extract_vcenter_name_from_vsource(xls)
 
-    st.dataframe(cluster_analysis, use_container_width=True)
+        st.markdown(f"**vCenter:** `{vcenter_name}`")
+
+        # Load vHost
+        try:
+            vhost = pd.read_excel(xls, sheet_name="vHost")
+            vhost.columns = vhost.columns.str.strip()
+        except Exception as e:
+            st.error(f"Error reading vHost sheet in {uploaded_file.name}: {e}")
+            continue
+
+        # CPU / ESXi summary
+        try:
+            cpu_df, assumptions = run_cpu_esxi_summary_for_vhost(
+                vhost=vhost,
+                hcl_df=hcl_df,
+                esxi_versions=esxi_versions,
+            )
+        except Exception as e:
+            st.error(f"Error generating CPU/ESXi summary for {uploaded_file.name}: {e}")
+            continue
+
+        # Cluster → Host mapping
+        try:
+            cluster_df = build_cluster_host_mapping(vhost)
+        except Exception as e:
+            st.error(f"Error generating cluster/host mapping for {uploaded_file.name}: {e}")
+            continue
+
+        # Show results in expanders
+        with st.expander(f"🧠 CPU / ESXi 9.x Summary - {vcenter_name}", expanded=True):
+            st.dataframe(cpu_df, use_container_width=True)
+
+        with st.expander(f"🧱 Cluster → Host Mapping - {vcenter_name}", expanded=False):
+            st.dataframe(cluster_df, use_container_width=True)
+
+        if assumptions:
+            with st.expander(f"ℹ️ Assumptions / Notes - {vcenter_name}", expanded=False):
+                for a in assumptions:
+                    st.write(f"- {a}")
+
+        # Create Excel for download
+        excel_bytes = create_per_vcenter_excel(cpu_df, cluster_df)
+        st.download_button(
+            label=f"⬇️ Download Excel report for {vcenter_name}",
+            data=excel_bytes,
+            file_name=f"{vcenter_name.replace('.', '_')}_ESXi9_Report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+else:
+    st.info("Upload files and click **Run Analysis** to start.")
