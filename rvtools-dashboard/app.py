@@ -257,6 +257,7 @@ with col_left:
 with col_right:
     hcl_file = st.file_uploader(
         "Upload Broadcom Systems/Servers HCL (CSV or Excel)",
+        "Get the latest compatibility file downloaded from https://compatibilityguide.broadcom.com/search?program=server&persona=live&column=partnerName&order=asc"
         type=["csv", "xlsx", "xls"],
     )
 
