@@ -313,8 +313,88 @@ with col_right:
 
 esxi_versions = ["ESXi 9.0", "ESXi 9.1"]
 
-if st.button("Run Analysis"):
+# Initialize session_state containers
+if "analysis_done" not in st.session_state:
+    st.session_state["analysis_done"] = False
+if "results" not in st.session_state:
+    st.session_state["results"] = []  # list of dicts: one per RVTools file
 
+def run_full_analysis(rvtools_files, hcl_df, esxi_versions):
+    """Run analysis for all RVTools files and store in session_state['results']."""
+    results = []
+    unknown_counter = 0
+
+    for idx, uploaded_file in enumerate(rvtools_files):
+        file_result = {
+            "file_name": uploaded_file.name,
+            "vcenter_name": None,
+            "cpu_df": None,
+            "cluster_df": None,
+            "assumptions": [],
+            "error": None,
+            "idx": idx,
+        }
+
+        try:
+            xls = pd.ExcelFile(uploaded_file)
+        except Exception as e:
+            file_result["error"] = f"Error reading Excel file {uploaded_file.name}: {e}"
+            results.append(file_result)
+            continue
+
+        raw_vcenter_name = extract_vcenter_name_from_vsource(xls)
+        if raw_vcenter_name:
+            vcenter_name = raw_vcenter_name
+        else:
+            unknown_counter += 1
+            vcenter_name = f"Unknown_vCenter_{unknown_counter}"
+        file_result["vcenter_name"] = vcenter_name
+
+        try:
+            vhost = pd.read_excel(xls, sheet_name="vHost")
+            vhost.columns = vhost.columns.str.strip()
+        except Exception as e:
+            file_result["error"] = f"Error reading vHost sheet in {uploaded_file.name}: {e}"
+            results.append(file_result)
+            continue
+
+        try:
+            cpu_df, assumptions_cpu = run_cpu_esxi_summary_for_vhost(
+                vhost=vhost,
+                hcl_df=hcl_df,
+                esxi_versions=esxi_versions,
+            )
+        except Exception as e:
+            file_result["error"] = f"Error generating CPU/ESXi summary for {uploaded_file.name}: {e}"
+            results.append(file_result)
+            continue
+
+        try:
+            cluster_df, assumptions_cluster = build_cluster_host_mapping(
+                vhost=vhost,
+                hcl_df=hcl_df,
+                esxi_versions=esxi_versions,
+            )
+        except Exception as e:
+            file_result["error"] = f"Error generating cluster/host mapping for {uploaded_file.name}: {e}"
+            results.append(file_result)
+            continue
+
+        file_result["cpu_df"] = cpu_df
+        file_result["cluster_df"] = cluster_df
+        file_result["assumptions"] = list(
+            {*(assumptions_cpu or []), *(assumptions_cluster or [])}
+        )
+
+        results.append(file_result)
+
+    st.session_state["results"] = results
+    st.session_state["analysis_done"] = True
+
+# Main interaction
+run_clicked = st.button("Run Analysis")
+
+if run_clicked:
     if not rvtools_files:
         st.error("Please upload at least one RVTools Excel file.")
         st.stop()
@@ -342,62 +422,26 @@ if st.button("Run Analysis"):
         st.stop()
 
     st.success("Files loaded. Running analysis.")
+    run_full_analysis(rvtools_files, hcl_df, esxi_versions)
 
-    # counter to ensure unique names when vCenter not found
-    unknown_counter = 0
-
-    for idx, uploaded_file in enumerate(rvtools_files):
+# Render results if analysis has been done
+if st.session_state["analysis_done"] and st.session_state["results"]:
+    for res in st.session_state["results"]:
         st.divider()
-        st.subheader(f"📁 RVTools File: {uploaded_file.name}")
+        st.subheader(f"📁 RVTools File: {res['file_name']}")
 
-        # Load Excel once, reuse across sheets
-        try:
-            xls = pd.ExcelFile(uploaded_file)
-        except Exception as e:
-            st.error(f"Error reading Excel file {uploaded_file.name}: {e}")
+        if res["error"]:
+            st.error(res["error"])
             continue
 
-        # Get vCenter name from vSource
-        raw_vcenter_name = extract_vcenter_name_from_vsource(xls)
-        if raw_vcenter_name:
-            vcenter_name = raw_vcenter_name
-        else:
-            unknown_counter += 1
-            vcenter_name = f"Unknown_vCenter_{unknown_counter}"
+        vcenter_name = res["vcenter_name"]
+        cpu_df = res["cpu_df"]
+        cluster_df = res["cluster_df"]
+        assumptions = res["assumptions"]
+        idx = res["idx"]
 
         st.markdown(f"**vCenter:** `{vcenter_name}`")
 
-        # Load vHost
-        try:
-            vhost = pd.read_excel(xls, sheet_name="vHost")
-            vhost.columns = vhost.columns.str.strip()
-        except Exception as e:
-            st.error(f"Error reading vHost sheet in {uploaded_file.name}: {e}")
-            continue
-
-        # CPU / ESXi summary
-        try:
-            cpu_df, assumptions_cpu = run_cpu_esxi_summary_for_vhost(
-                vhost=vhost,
-                hcl_df=hcl_df,
-                esxi_versions=esxi_versions,
-            )
-        except Exception as e:
-            st.error(f"Error generating CPU/ESXi summary for {uploaded_file.name}: {e}")
-            continue
-
-        # Cluster → Host mapping with ESXi support
-        try:
-            cluster_df, assumptions_cluster = build_cluster_host_mapping(
-                vhost=vhost,
-                hcl_df=hcl_df,
-                esxi_versions=esxi_versions,
-            )
-        except Exception as e:
-            st.error(f"Error generating cluster/host mapping for {uploaded_file.name}: {e}")
-            continue
-
-        # Show results in expanders
         with st.expander(f"🧠 CPU / ESXi 9.x Summary - {vcenter_name}", expanded=True):
             st.dataframe(cpu_df, use_container_width=True)
 
@@ -407,24 +451,17 @@ if st.button("Run Analysis"):
         ):
             st.dataframe(cluster_df, use_container_width=True)
 
-        all_assumptions = assumptions_cpu + assumptions_cluster
-        if all_assumptions:
+        if assumptions:
             with st.expander(f"ℹ️ Assumptions / Notes - {vcenter_name}", expanded=False):
-                seen_a = set()
-                for a in all_assumptions:
-                    if a not in seen_a:
-                        seen_a.add(a)
-                        st.write(f"- {a}")
+                for a in assumptions:
+                    st.write(f"- {a}")
 
         # Create Excel for download
         excel_bytes = create_per_vcenter_excel(cpu_df, cluster_df)
-
-        # Generate a safe base for the filename
         safe_vcenter_name = (
             vcenter_name.replace(" ", "_").replace(".", "_").replace("/", "_")
         )
 
-        # Use a unique key per button to avoid StreamlitDuplicateElementId
         st.download_button(
             label=f"⬇️ Download Excel report for {vcenter_name}",
             data=excel_bytes,
